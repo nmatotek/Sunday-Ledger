@@ -1,0 +1,996 @@
+<!DOCTYPE html>
+<html lang="en">
+<!--
+SUNDAY-LEDGER MANIFEST (for Claude: read this before patching; bump version + append changelog on every update)
+{
+ "app":"sunday-ledger","version":"2.0",
+ "storage_key":"sl:weeks",
+ "entry_schema":{"date":"YYYY-MM-DD","days":"1-7","sleep":"0-100|null","ready":"0-100|null","hrv":"ms|null","hours":"decimal|null","spend":"$|null","events":"int|null","cats":"[{name,amount}]","note":"string|null"},
+ "update_ritual":"User uploads THIS file from cloud storage + describes the change. Patch this exact file (never rebuild from memory), bump version badge + manifest, append changelog line, run node --check on extracted script, test localExtract against Oura AI report fixtures, ship via present_files. Data is separate from code: user's entries live in artifact storage or their cloud backup .json - code updates never touch data.",
+ "environment_notes":"User's view may lack API bridge and window.storage (both probed at runtime). localExtract is the reliable parse path; window.storage failures degrade to session + cloud file backup.",
+ "changelog":[
+  "0.1 initial: screenshot parse, storage, trends",
+  "0.2 narrative report parsing rules",
+  "0.3 days-covered field (1-7), flexible entry dates",
+  "0.4 guarded resp.json, stage-labeled errors, version badge",
+  "0.5 localExtract offline parser fallback (tested vs Oura AI report)",
+  "0.6 storage probe + banner, session saves, copy/paste backup",
+  "0.7 cloud file backup: download/load .json, merge on restore",
+  "0.8 embedded manifest + changelog, update ritual",
+  "1.0 tiered storage (artifact/localStorage/memory), storage tier tag, PWA packaging for hosting",
+  "1.1 broadened HRV extraction (spelled-out alias, value-first, of-X phrasing)",
+  "1.2 week-ahead schedule card: per-day commitments, events prefill, backup v2 {weeks,schedule}, v1 backups still import",
+  "1.3 calendar paste import: parses Day/Date-prefixed lines into schedule chips with times, dedupes",
+  "1.4 build-time calendar seed (SCHED_SEED): Claude embeds the real week when shipping; saved schedules always win; stale seeds ignored. Update ritual now includes: pull user calendar, refresh SCHED_SEED",
+  "2.0 live Google Calendar sync: GIS OAuth (calendar.readonly), in-app Client ID setup, auto-sync on launch, Refresh button, src-g chips replaced per sync while manual chips survive"
+ ]
+}
+-->
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sunday Ledger</title>
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#111214">
+<link rel="apple-touch-icon" href="icon-192.png">
+<style>
+  :root{
+    --ink:#111214; --panel:#1a1c1f; --panel2:#232629; --line:#2c2f33;
+    --stitch:#c98a4b; --stitch-dim:#8a5f36;
+    --fog:#a7adb5; --paper:#eceff2; --ok:#7fb069; --warn:#d1a05a; --err:#d16a5a;
+    --sleep:#7f9fb0; --ready:#7fb069; --money:#c98a4b;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--ink)}
+  .sl{
+    font-family:ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif;
+    background:var(--ink);color:var(--paper);min-height:100vh;
+    max-width:560px;margin:0 auto;padding:20px 16px 40px;
+  }
+  .sl header{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px}
+  .sl .brand{font-size:13px;letter-spacing:.18em;text-transform:uppercase;color:var(--stitch);font-weight:600}
+  .sl .ver{
+    font-size:10px;letter-spacing:.06em;color:var(--fog);font-weight:600;
+    border:1px solid var(--line);border-radius:6px;padding:2px 6px;margin-left:6px;vertical-align:1px;
+  }
+  .sl .wk{font-size:13px;color:var(--fog)}
+  .sl h1{font-size:24px;font-weight:700;letter-spacing:-.01em;margin:2px 0 16px}
+  .sl .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px;margin-bottom:14px}
+  .sl .card h2{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--fog);margin-bottom:12px}
+
+  /* input mode tabs */
+  .tabs{display:flex;gap:6px;margin-bottom:12px}
+  .tab{
+    flex:1;padding:9px 4px;border:1px solid var(--line);border-radius:10px;background:var(--panel2);
+    color:var(--fog);font-size:12.5px;font-weight:600;text-align:center;cursor:pointer;
+    transition:border-color .15s,color .15s;
+  }
+  .tab.on{border-color:var(--stitch);color:var(--stitch)}
+  .tab:focus-visible{outline:2px solid var(--stitch);outline-offset:2px}
+
+  .drop{
+    border:1.5px dashed var(--stitch-dim);border-radius:12px;padding:18px;
+    text-align:center;color:var(--fog);font-size:13.5px;cursor:pointer;background:var(--panel2);
+  }
+  .drop.busy{opacity:.6;pointer-events:none}
+  .drop b{color:var(--stitch)}
+  .thumbs{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+  .thumbs img{width:56px;height:56px;object-fit:cover;border-radius:8px;border:1px solid var(--line)}
+
+  textarea.stats{
+    width:100%;min-height:120px;resize:vertical;background:var(--panel2);
+    border:1px solid var(--line);border-radius:12px;color:var(--paper);
+    font-family:inherit;font-size:14px;line-height:1.5;padding:12px;
+  }
+  textarea.stats::placeholder{color:#5c6167}
+  textarea.stats:focus{outline:none;border-color:var(--stitch-dim)}
+
+  .btn{
+    display:block;width:100%;padding:12px;border:none;border-radius:11px;
+    background:var(--stitch);color:#16110b;font-size:14px;font-weight:700;cursor:pointer;margin-top:10px;
+  }
+  .btn:disabled{opacity:.45;cursor:default}
+  .btn.ghost{background:transparent;border:1px solid var(--line);color:var(--fog);font-weight:600}
+  .btn:focus-visible{outline:2px solid var(--paper);outline-offset:2px}
+  .hint{font-size:12px;color:var(--fog);margin-top:8px;line-height:1.5}
+  .status{font-size:13px;margin-top:10px;color:var(--fog)}
+  .status.err{color:var(--err)}
+  .status.ok{color:var(--ok)}
+
+  /* review form */
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .field{margin-bottom:10px}
+  .field label{display:block;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--fog);margin-bottom:5px}
+  .field input{
+    width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:9px;
+    color:var(--paper);font-size:15px;padding:9px 10px;font-family:inherit;
+  }
+  .field input:focus{outline:none;border-color:var(--stitch-dim)}
+  .catrow{display:flex;gap:8px;margin-bottom:8px}
+  .catrow input:first-child{flex:1.6}
+  .catrow input:nth-child(2){flex:1}
+  .catrow button{
+    background:none;border:none;color:var(--err);font-size:17px;cursor:pointer;padding:0 4px;
+  }
+  .addcat{background:none;border:none;color:var(--stitch);font-size:13px;font-weight:600;cursor:pointer;padding:4px 0}
+
+  /* latest week tiles */
+  .tiles{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .tile{background:var(--panel2);border:1px solid var(--line);border-radius:11px;padding:12px}
+  .tile .lbl{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--fog)}
+  .tile .val{font-size:23px;font-weight:700;margin-top:3px}
+  .tile .delta{font-size:12px;margin-top:2px;font-weight:600}
+  .up-good{color:var(--ok)} .down-bad{color:var(--err)} .flat{color:var(--fog)} .up-warn{color:var(--warn)}
+  .note-latest{font-size:13px;color:var(--fog);margin-top:12px;font-style:italic;line-height:1.5}
+
+  /* charts */
+  .legend{display:flex;gap:14px;font-size:11.5px;color:var(--fog);margin-bottom:8px}
+  .legend i{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:5px}
+  svg text{fill:var(--fog);font-size:10px;font-family:inherit}
+  .catbars .row{display:flex;align-items:center;gap:10px;margin-bottom:7px;font-size:12.5px}
+  .catbars .nm{width:96px;color:var(--fog);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .catbars .bar{flex:1;height:9px;background:var(--panel2);border-radius:5px;overflow:hidden}
+  .catbars .bar i{display:block;height:100%;background:var(--money);border-radius:5px}
+  .catbars .amt{width:62px;text-align:right;font-weight:600}
+
+  /* schedule */
+  .sday{display:flex;align-items:flex-start;gap:10px;padding:7px 0;border-bottom:1px solid var(--line)}
+  .sday:last-of-type{border-bottom:none}
+  .sday .dl{width:38px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--fog);padding-top:6px}
+  .sday .chips{flex:1;display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+  .chip{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:4px 8px;font-size:12.5px;display:inline-flex;align-items:center;gap:6px}
+  .chip button{background:none;border:none;color:var(--err);cursor:pointer;font-size:13px;padding:0;line-height:1}
+  .sadd{background:var(--panel2);border:1px solid var(--line);border-radius:8px;color:var(--paper);font-size:12.5px;padding:4px 8px;width:96px;font-family:inherit}
+  .sadd::placeholder{color:#5c6167}
+  .sadd:focus{outline:none;border-color:var(--stitch-dim);width:150px}
+  .sched-meta{display:flex;justify-content:space-between;align-items:center;margin-top:10px}
+  .sched-count{font-size:12px;color:var(--fog)}
+
+  /* history */
+  .hrow{
+    display:flex;justify-content:space-between;align-items:center;
+    padding:11px 0;border-bottom:1px solid var(--line);font-size:13.5px;
+  }
+  .hrow:last-child{border-bottom:none}
+  .hrow .d{color:var(--fog);font-size:12px;margin-top:2px}
+  .hrow .nums{color:var(--fog);font-size:12.5px}
+  .hrow button{background:none;border:none;color:var(--err);cursor:pointer;font-size:12.5px;padding:4px}
+  .empty{color:var(--fog);font-size:13.5px;line-height:1.6}
+  .hide{display:none}
+  @media (prefers-reduced-motion: no-preference){
+    .card{animation:rise .25s ease-out}
+    @keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+  }
+</style>
+</head>
+<body>
+<div class="sl">
+  <header>
+    <span class="brand">Sunday Ledger <span class="ver">v2.0</span></span>
+    <span class="wk"><span id="tierTag" style="margin-right:8px;font-size:11px"></span><span id="today"></span></span>
+  </header>
+  <h1>Body / Time / Money</h1>
+
+  <div class="card hide" id="storeBanner" style="border-color:var(--warn);padding:12px 16px">
+    <div style="font-size:12.5px;color:var(--warn);line-height:1.5">
+      No persistent storage in this view — entries last this session only.
+      Use <b>Copy backup</b> after saving, or open the Ledger from the Artifacts space for permanent saves.
+    </div>
+  </div>
+
+  <!-- LATEST WEEK -->
+  <div class="card hide" id="latestCard">
+    <h2 id="latestTitle">Latest week</h2>
+    <div class="tiles" id="tiles"></div>
+    <div class="note-latest" id="latestNote"></div>
+  </div>
+
+  <!-- WEEK AHEAD -->
+  <div class="card" id="schedCard">
+    <h2>Week ahead <span id="schedRange" style="letter-spacing:0;text-transform:none;color:var(--stitch)"></span></h2>
+    <div id="schedDays"></div>
+    <div class="sched-meta">
+      <span class="sched-count" id="schedCount"></span>
+      <button class="addcat" id="schedClear">clear week</button>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:8px">
+      <button class="btn ghost" id="gcalBtn" style="margin-top:0">Connect Google Calendar</button>
+    </div>
+    <div class="status hide" id="gcalStatus" role="status" style="margin-top:8px"></div>
+    <div id="gcalSetup" class="hide" style="margin-top:8px">
+      <div class="hint" style="margin-top:0">One-time setup: paste your Google OAuth Client ID (from console.cloud.google.com &mdash; steps in the README).</div>
+      <input id="gcalClientId" placeholder="xxxxxxxx.apps.googleusercontent.com" style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:9px;color:var(--paper);font-size:13px;padding:9px 10px;font-family:inherit;margin-top:6px">
+      <button class="btn ghost" id="gcalSaveId" style="margin-top:8px">Save &amp; connect</button>
+    </div>
+    <textarea class="stats" id="schedPaste" style="min-height:56px;font-size:12.5px;margin-top:8px" placeholder="Paste calendar text — one event per line, like: Fri 6:00 PM — Game Night. Ask Claude for your week and paste it here."></textarea>
+    <button class="btn ghost" id="schedImport" style="margin-top:8px">Import into week</button>
+  </div>
+
+  <!-- LOG A WEEK -->
+  <div class="card">
+    <h2>Log this week</h2>
+    <div class="tabs" role="tablist">
+      <button class="tab on" id="tabShots" role="tab">Screenshots</button>
+      <button class="tab" id="tabType" role="tab">Type it out</button>
+      <button class="tab" id="tabManual" role="tab">Manual</button>
+    </div>
+
+    <!-- screenshots mode -->
+    <div id="modeShots">
+      <div class="drop" id="drop" tabindex="0">
+        Tap to add your <b>Oura</b> + <b>Rocket Money</b> screenshots<br>
+        <span style="font-size:12px">then Parse — numbers land in editable fields</span>
+      </div>
+      <input type="file" id="file" accept="image/*" multiple class="hide">
+      <div class="thumbs" id="thumbs"></div>
+      <button class="btn hide" id="parseShots">Parse screenshots</button>
+    </div>
+
+    <!-- typed mode -->
+    <div id="modeType" class="hide">
+      <textarea class="stats" id="statsText" placeholder="Type your stats — or paste a whole Oura AI report. I'll pull the averages out and organize them.
+
+e.g. sleep score 84, readiness 79, hrv avg 44, slept about 7h10m a night. spent $712 — groceries 190, dining 145, gas 80. 6 events. car pickup week."></textarea>
+      <button class="btn" id="parseText">Organize into the ledger</button>
+      <div class="hint">Free-form is fine — sentences, fragments, numbers dumped from memory. Anything you skip stays blank and editable below.</div>
+    </div>
+
+    <!-- manual mode -->
+    <div id="modeManual" class="hide">
+      <div class="hint" style="margin-top:0">Straight to the form — no parsing, just type into the fields below.</div>
+      <button class="btn ghost" id="openManual">Open blank week form</button>
+    </div>
+
+    <div class="status hide" id="status" role="status"></div>
+  </div>
+
+  <!-- REVIEW / EDIT FORM -->
+  <div class="card hide" id="reviewCard">
+    <h2>Review &amp; save</h2>
+    <div class="grid2">
+      <div class="field">
+        <label for="fDate">Entry date</label>
+        <input type="date" id="fDate">
+      </div>
+      <div class="field">
+        <label for="fDays">Days covered (1–7)</label>
+        <input type="number" id="fDays" min="1" max="7" inputmode="numeric">
+      </div>
+    </div>
+    <div class="grid2">
+      <div class="field"><label for="fSleep">Sleep score</label><input type="number" id="fSleep" inputmode="numeric"></div>
+      <div class="field"><label for="fReady">Readiness</label><input type="number" id="fReady" inputmode="numeric"></div>
+      <div class="field"><label for="fHrv">Avg HRV</label><input type="number" id="fHrv" inputmode="numeric"></div>
+      <div class="field"><label for="fHours">Avg sleep (hrs)</label><input type="number" step="0.1" id="fHours" inputmode="decimal"></div>
+      <div class="field"><label for="fSpend">Total spend ($)</label><input type="number" step="0.01" id="fSpend" inputmode="decimal"></div>
+      <div class="field"><label for="fEvents">Calendar events</label><input type="number" id="fEvents" inputmode="numeric"></div>
+    </div>
+    <div class="field">
+      <label>Top spend categories</label>
+      <div id="cats"></div>
+      <button class="addcat" id="addCat">+ add category</button>
+    </div>
+    <div class="field">
+      <label for="fNote">Week note</label>
+      <input type="text" id="fNote" placeholder='the context you"ll want in 3 months'>
+    </div>
+    <button class="btn" id="saveWeek">Save week</button>
+    <div class="status hide" id="saveStatus" role="status"></div>
+  </div>
+
+  <!-- TRENDS -->
+  <div class="card hide" id="trendCard">
+    <h2>Body trends</h2>
+    <div class="legend">
+      <span><i style="background:var(--sleep)"></i>Sleep</span>
+      <span><i style="background:var(--ready)"></i>Readiness</span>
+      <span><i style="background:var(--stitch)"></i>HRV</span>
+    </div>
+    <div id="bodyChart"></div>
+  </div>
+
+  <div class="card hide" id="spendCard">
+    <h2>Spend by week</h2>
+    <div id="spendChart"></div>
+    <div class="catbars" id="catBars" style="margin-top:14px"></div>
+  </div>
+
+  <!-- HISTORY -->
+  <div class="card" id="histCard">
+    <h2>History</h2>
+    <div id="history"><div class="empty">No weeks logged yet. First entry starts the record — trends appear at week two.</div></div>
+    <div style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px">
+      <textarea class="stats" id="backupBox" style="min-height:64px;font-size:12px" placeholder="Backup lives here — Copy backup fills this with your data as text. Paste a backup here and tap Restore to load it anywhere."></textarea>
+      <div style="display:flex;gap:8px">
+        <button class="btn ghost" id="expBtn" style="margin-top:8px">Copy backup</button>
+        <button class="btn ghost" id="impBtn" style="margin-top:8px">Restore</button>
+      </div>
+      <div style="display:flex;gap:8px">
+        <button class="btn ghost" id="dlBtn" style="margin-top:8px">Download backup file</button>
+        <button class="btn ghost" id="ulBtn" style="margin-top:8px">Load backup file</button>
+      </div>
+      <input type="file" id="ulInput" accept=".json,application/json,text/plain" class="hide">
+      <div class="status hide" id="bakStatus" role="status"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  const KEY='sl:weeks';
+  let weeks=[];          // [{date,sleep,ready,hrv,hours,spend,events,cats:[{name,amount}],note}]
+  let images=[];         // pending screenshot base64s {data,media}
+
+  const $=id=>document.getElementById(id);
+  const fmt$=n=>'$'+Number(n).toLocaleString('en-US',{maximumFractionDigits:0});
+
+  // ---------- date helpers ----------
+  function lastSunday(){
+    const d=new Date(); d.setDate(d.getDate()-d.getDay());
+    return d.toISOString().slice(0,10);
+  }
+  function niceDate(iso){
+    const [y,m,d]=iso.split('-').map(Number);
+    return new Date(y,m-1,d).toLocaleDateString('en-US',{month:'short',day:'numeric'});
+  }
+  $('today').textContent=new Date().toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'});
+
+  // ---------- storage: tiered adapter ----------
+  // Tier 1: window.storage (Claude artifact runtime, syncs via Claude account)
+  // Tier 2: localStorage (normal browsers: hosted/PWA/Mac Safari - persists per device)
+  //         NOTE: localStorage does NOT exist in Claude.ai artifacts; only used when truly available.
+  // Tier 3: memory only (session) - banner shows, cloud .json backup is the lifeline
+  let storeTier='memory';
+  const store={
+    async get(k){
+      if(storeTier==='artifact'){ try{const r=await window.storage.get(k);return r?r.value:null;}catch(e){return null;} }
+      if(storeTier==='local'){ try{return localStorage.getItem(k);}catch(e){return null;} }
+      return null;
+    },
+    async set(k,v){
+      if(storeTier==='artifact'){ try{const r=await window.storage.set(k,v);return !!r;}catch(e){return false;} }
+      if(storeTier==='local'){ try{localStorage.setItem(k,v);return true;}catch(e){return false;} }
+      return false;
+    }
+  };
+  async function detectStorage(){
+    try{
+      if(window.storage&&typeof window.storage.set==='function'){
+        await window.storage.set('sl:probe','1');
+        const r=await window.storage.get('sl:probe');
+        if(r&&r.value==='1'){ storeTier='artifact'; return; }
+      }
+    }catch(e){}
+    try{
+      if(typeof localStorage!=='undefined'){
+        localStorage.setItem('sl:probe','1');
+        if(localStorage.getItem('sl:probe')==='1'){ localStorage.removeItem('sl:probe'); storeTier='local'; return; }
+      }
+    }catch(e){}
+    storeTier='memory';
+  }
+  async function load(){
+    await detectStorage();
+    $('storeBanner').classList.toggle('hide',storeTier!=='memory');
+    const tierTag=$('tierTag');
+    if(tierTag) tierTag.textContent=storeTier==='artifact'?'\u25cf synced storage':storeTier==='local'?'\u25cf device storage':'\u25cb session only';
+    try{
+      const v=await store.get(KEY);
+      weeks=v?JSON.parse(v):[];
+    }catch(e){ weeks=[]; }
+    weeks.sort((a,b)=>a.date.localeCompare(b.date));
+    render();
+  }
+  async function persist(){
+    if(storeTier==='memory') return 'session';
+    return (await store.set(KEY,JSON.stringify(weeks)))?true:false;
+  }
+
+  // ---------- tabs ----------
+  const modes={tabShots:'modeShots',tabType:'modeType',tabManual:'modeManual'};
+  Object.keys(modes).forEach(t=>{
+    $(t).onclick=()=>{
+      Object.keys(modes).forEach(k=>{
+        $(k).classList.toggle('on',k===t);
+        $(modes[k]).classList.toggle('hide',k!==t);
+      });
+      hideStatus();
+    };
+  });
+
+  // ---------- status ----------
+  function setStatus(msg,cls){
+    const s=$('status'); s.textContent=msg; s.className='status '+(cls||''); s.classList.remove('hide');
+  }
+  function hideStatus(){ $('status').classList.add('hide'); }
+
+  // ---------- screenshots ----------
+  $('drop').onclick=()=>$('file').click();
+  $('drop').onkeydown=e=>{ if(e.key==='Enter'||e.key===' '){e.preventDefault();$('file').click();} };
+  $('file').onchange=async e=>{
+    for(const f of e.target.files){
+      const data=await new Promise((res,rej)=>{
+        const r=new FileReader();
+        r.onload=()=>res(r.result.split(',')[1]);
+        r.onerror=()=>rej(new Error('read failed'));
+        r.readAsDataURL(f);
+      });
+      images.push({data,media:f.type||'image/png'});
+      const img=document.createElement('img');
+      img.src='data:'+(f.type||'image/png')+';base64,'+data;
+      $('thumbs').appendChild(img);
+    }
+    if(images.length) $('parseShots').classList.remove('hide');
+  };
+
+  // ---------- Claude parsing ----------
+  // localExtract: deterministic fallback parser, zero API dependency.
+  // Tested against Oura AI narrative reports and casual typed stats.
+  function localExtract(t){
+    const out={sleep:null,ready:null,hrv:null,hours:null,spend:null,events:null,cats:[],note:null,days:7};
+    const num=s=>Number(String(s).replace(/,/g,''));
+    let m=t.match(/last\s+(\d+)\s*hours?/i);
+    if(m) out.days=Math.max(1,Math.min(7,Math.round(num(m[1])/24)));
+    else if((m=t.match(/last\s+(\d+)\s*days?/i))) out.days=Math.max(1,Math.min(7,num(m[1])));
+    else if(/this week|past week|last week/i.test(t)) out.days=7;
+    m=t.match(/sleep scores?[^.]*?average(?:\s+of)?\s+~?(\d{1,3})/i);
+    if(!m) m=t.match(/sleep score[^0-9]{0,20}(\d{1,3})/i);
+    if(m&&num(m[1])<=100) out.sleep=num(m[1]);
+    m=t.match(/readiness[^.]*?\u2014?\s*(\d{1,3})\s+on\s/i);
+    if(!m) m=t.match(/readiness[^0-9]{0,25}(\d{1,3})/i);
+    if(m&&num(m[1])<=100) out.ready=num(m[1]);
+    m=t.match(/hrv[^.]*?(\d{1,3})\s*ms/i);
+    if(!m) m=t.match(/heart rate variability[^0-9]{0,30}(\d{1,3})/i);
+    if(!m) m=t.match(/(\d{1,3})\s*ms\b[^.]{0,20}\bhrv/i);
+    if(!m) m=t.match(/hrv[^0-9]{0,25}(\d{1,3})/i);
+    if(m) out.hrv=num(m[1]);
+    const nights=[...t.matchAll(/(\d{1,2})h\s*(\d{1,2})m\s+of\s+sleep/gi)].map(x=>num(x[1])+num(x[2])/60);
+    if(nights.length) out.hours=+(nights.reduce((a,b)=>a+b,0)/nights.length).toFixed(1);
+    else if((m=t.match(/(?:slept|sleep(?:ing)?)[^.]*?(\d{1,2})h\s*(\d{1,2})m/i))) out.hours=+(num(m[1])+num(m[2])/60).toFixed(1);
+    else if((m=t.match(/(?:slept|avg(?:erage)? sleep)[^.]*?(\d(?:\.\d)?)\s*(?:hours|hrs|h)\b/i))) out.hours=num(m[1]);
+    m=t.match(/(?:spent|total spend|spend(?:ing)?(?:\s+was)?)[^$0-9]{0,12}\$?([\d,]+(?:\.\d{1,2})?)/i);
+    if(m) out.spend=num(m[1]);
+    if(out.spend!=null) for(const c of t.matchAll(/(?:^|[,;\u2014\u2022\n])\s*([A-Za-z][A-Za-z /&']{2,24}?)\s+\$?(\d{2,5})(?=[,;.\n)]|$)/gm)){
+      const name=c[1].trim().toLowerCase();
+      if(/^(aug|jul|sep|oct|nov|dec|jan|feb|mar|apr|may|jun|score|scores|hrv|readiness|sleep|steps|up from|down|low of|dropped to|jumped to|age is|averaging|at|ranged|index of|from|to|just)/.test(name)) continue;
+      if(num(c[2])<=(out.spend||1e9)) out.cats.push({name:c[1].trim(),amount:num(c[2])});
+      if(out.cats.length>=6) break;
+    }
+    m=t.match(/(\d{1,2})\s+(?:calendar\s+)?events\b/i);
+    if(m) out.events=num(m[1]);
+    const bits=[];
+    if(out.days<7) bits.push(out.days+'-day window');
+    if(/late bedtime|2:\d{2}\s*am|1:\d{2}\s*am|12:0\d\s*am/i.test(t)) bits.push('late bedtimes');
+    if(/stress[^.]*high/i.test(t)) bits.push('high stress wk');
+    if(/rebound|improved notably|best in this window/i.test(t)) bits.push('rebound last night');
+    if(bits.length) out.note=bits.join(', ');
+    const found=['sleep','ready','hrv','hours','spend','events'].filter(k=>out[k]!=null).length;
+    return {result:out,found};
+  }
+
+  const SCHEMA=`You are a data extractor. Respond with ONLY a single JSON object - no markdown fences, no explanation, no text before or after it. Schema:
+{"sleep":number|null,"ready":number|null,"hrv":number|null,"hours":number|null,"spend":number|null,"events":number|null,"cats":[{"name":string,"amount":number}],"note":string|null,"days":number}
+Rules: days = how many days the data covers, 1 to 7 (e.g. "last 72 hours" = 3, "this week" = 7); use 7 if unclear. sleep = Oura sleep score (0-100) for the period. ready = readiness score. hrv = average HRV in ms. hours = average nightly sleep in decimal hours (convert 7h12m to 7.2). spend = total weekly spend in dollars. cats = top spending categories with dollar amounts, largest first, max 6. events = count of calendar events if mentioned. note = short week context, else null.
+The input may be a narrative health report (e.g. Oura AI output) covering multiple days, with ranges, per-night detail, and long-term trend commentary. In that case: prefer the stated period AVERAGE for each metric (e.g. "ranged 58 to 76, average 64" means sleep=64). If only a range is given with no average, use the midpoint. If only single-night values are given for HRV or resting HR, use the most recent night. For hours, prefer the stated average nightly duration; if only per-night durations are listed, average them. IGNORE 30-day or long-term trend figures - only the current period counts. Ignore heart-health extras (SpO2, cardiovascular age, blood pressure dipping). If the report covers fewer than 7 days, still extract the numbers and set days accordingly. If the report highlights notable context (very late bedtimes, high stress week, rebound night), compress it into the note in under 12 words. Use null for anything not present. Never invent numbers.`;
+
+  async function callClaude(content){
+    let resp;
+    try{
+      resp=await fetch('https://api.anthropic.com/v1/messages',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({
+          model:'claude-sonnet-4-6',
+          max_tokens:1000,
+          messages:[{role:'user',content}]
+        })
+      });
+    }catch(e){ throw new Error('network: '+e.message); }
+    const rawBody=await resp.text();
+    if(!resp.ok) throw new Error('HTTP '+resp.status+(rawBody?' \u2014 '+rawBody.slice(0,120):' (empty body)'));
+    let data;
+    try{ data=JSON.parse(rawBody); }
+    catch(e){ throw new Error('API sent non-JSON: '+rawBody.slice(0,80)); }
+    if(data.error) throw new Error('API: '+(data.error.message||data.error.type||'request failed'));
+    const text=(data.content||[]).filter(b=>b.type==='text').map(b=>b.text).join('\n');
+    if(!text.trim()) throw new Error('Empty response from parser');
+    // tolerate preamble/fences: grab the outermost JSON object
+    const m=text.match(/\{[\s\S]*\}/);
+    if(!m) throw new Error('No JSON found in response');
+    try{ return JSON.parse(m[0]); }
+    catch(e){ throw new Error('Malformed JSON from parser'); }
+  }
+
+  $('parseShots').onclick=async()=>{
+    if(!images.length) return;
+    $('drop').classList.add('busy'); $('parseShots').disabled=true;
+    setStatus('Reading screenshots\u2026');
+    try{
+      const content=[
+        ...images.map(im=>({type:'image',source:{type:'base64',media_type:im.media,data:im.data}})),
+        {type:'text',text:'Extract this week\u2019s health and spending stats from these app screenshots (Oura, Rocket Money, or similar). '+SCHEMA}
+      ];
+      fillForm(await callClaude(content));
+      setStatus('Parsed \u2014 check the fields below, then save.','ok');
+    }catch(e){
+      setStatus('Parse failed ('+e.message+'). Try again, clearer screenshots, or Type it out.','err');
+    }
+    $('drop').classList.remove('busy'); $('parseShots').disabled=false;
+  };
+
+  $('parseText').onclick=async()=>{
+    const raw=$('statsText').value.trim();
+    if(!raw){ setStatus('Nothing to organize yet \u2014 type some stats first.','err'); return; }
+    $('parseText').disabled=true;
+    setStatus('Organizing\u2026');
+    try{
+      const content=[{type:'text',text:SCHEMA+'\n\nNow extract from this input (it may be casual fragments, or a full narrative health report):\n\n'+raw}];
+      fillForm(await callClaude(content));
+      setStatus('Organized \u2014 review below, then save.','ok');
+    }catch(e){
+      // API path failed - fall back to the built-in local parser
+      const local=localExtract(raw);
+      if(local.found>0){
+        fillForm(local.result);
+        setStatus('Organized with built-in parser ('+local.found+' metrics found) \u2014 review below, then save.','ok');
+      }else{
+        setStatus('Parse failed ('+e.message+') and the built-in parser found no metrics. Use Manual entry.','err');
+      }
+    }
+    $('parseText').disabled=false;
+  };
+
+  $('openManual').onclick=()=>{ fillForm({}); hideStatus(); };
+
+  // ---------- form ----------
+  function catRow(name,amount){
+    const row=document.createElement('div'); row.className='catrow';
+    row.innerHTML='<input placeholder="Category" value="'+(name||'').replace(/"/g,'&quot;')+'">'+
+      '<input type="number" step="0.01" inputmode="decimal" placeholder="$" value="'+(amount!=null?amount:'')+'">'+
+      '<button aria-label="Remove category">\u00d7</button>';
+    row.querySelector('button').onclick=()=>row.remove();
+    return row;
+  }
+  $('addCat').onclick=()=>$('cats').appendChild(catRow('',null));
+
+  function fillForm(p){
+    $('fDate').value=new Date().toISOString().slice(0,10);
+    $('fDays').value=Math.min(7,Math.max(1,p.days||7));
+    $('fSleep').value=p.sleep??'';
+    $('fReady').value=p.ready??'';
+    $('fHrv').value=p.hrv??'';
+    $('fHours').value=p.hours??'';
+    $('fSpend').value=p.spend??'';
+    $('fEvents').value=p.events??(sched.items.length||'');
+    $('fNote').value=p.note??'';
+    $('cats').innerHTML='';
+    (p.cats&&p.cats.length?p.cats:[{name:'',amount:null}]).forEach(c=>$('cats').appendChild(catRow(c.name,c.amount)));
+    $('reviewCard').classList.remove('hide');
+    $('reviewCard').scrollIntoView({behavior:'smooth',block:'start'});
+  }
+
+  $('saveWeek').onclick=async()=>{
+    const num=v=>v===''?null:Number(v);
+    const entry={
+      date:$('fDate').value||new Date().toISOString().slice(0,10),
+      days:Math.min(7,Math.max(1,num($('fDays').value)||7)),
+      sleep:num($('fSleep').value), ready:num($('fReady').value),
+      hrv:num($('fHrv').value), hours:num($('fHours').value),
+      spend:num($('fSpend').value), events:num($('fEvents').value),
+      note:$('fNote').value.trim()||null,
+      cats:[...$('cats').querySelectorAll('.catrow')].map(r=>{
+        const [n,a]=r.querySelectorAll('input');
+        return {name:n.value.trim(),amount:a.value===''?null:Number(a.value)};
+      }).filter(c=>c.name)
+    };
+    weeks=weeks.filter(w=>w.date!==entry.date);   // one entry per Sunday
+    weeks.push(entry);
+    weeks.sort((a,b)=>a.date.localeCompare(b.date));
+    const ok=await persist();
+    const s=$('saveStatus');
+    if(ok===true){
+      s.textContent='Saved \u2014 '+niceDate(entry.date)+' ('+entry.days+'-day) is in the record.';
+      s.className='status ok';
+    }else if(ok==='session'){
+      s.textContent='Logged for this session \u2014 no persistent storage in this view. Tap Copy backup below to keep it, or reopen from the Artifacts space to save permanently.';
+      s.className='status';
+    }else{
+      s.textContent='Save failed \u2014 storage error. Copy a backup below so nothing is lost.';
+      s.className='status err';
+    }
+    s.classList.remove('hide');
+    if(ok){
+      images=[]; $('thumbs').innerHTML=''; $('parseShots').classList.add('hide');
+      $('statsText').value='';
+      render();
+    }
+  };
+
+  // ---------- render ----------
+  function delta(cur,prev,goodUp,unit){
+    if(cur==null||prev==null) return '<span class="flat">\u2014</span>';
+    const d=cur-prev;
+    if(Math.abs(d)<0.05) return '<span class="flat">\u00b1 0</span>';
+    const up=d>0, good=goodUp?up:!up;
+    const cls=good?'up-good':(goodUp?'down-bad':'up-warn');
+    return '<span class="'+cls+'">'+(up?'\u25b2':'\u25bc')+' '+Math.abs(unit==='$'?Math.round(d):+d.toFixed(1))+(unit==='$'?'':unit||'')+'</span>';
+  }
+
+  function render(){
+    // latest
+    if(weeks.length){
+      const L=weeks[weeks.length-1], P=weeks[weeks.length-2]||{};
+      $('latestCard').classList.remove('hide');
+      $('latestTitle').textContent='Latest \u2014 '+niceDate(L.date)+((L.days||7)<7?' \u00b7 '+L.days+'-day window':' \u00b7 full week');
+      const t=(lbl,val,dl)=>'<div class="tile"><div class="lbl">'+lbl+'</div><div class="val">'+val+'</div><div class="delta">'+dl+'</div></div>';
+      $('tiles').innerHTML=
+        t('Sleep',L.sleep??'\u2014',delta(L.sleep,P.sleep,true))+
+        t('Readiness',L.ready??'\u2014',delta(L.ready,P.ready,true))+
+        t('Avg HRV',L.hrv!=null?L.hrv+'<span style="font-size:13px;color:var(--fog)"> ms</span>':'\u2014',delta(L.hrv,P.hrv,true))+
+        t('Spend',L.spend!=null?fmt$(L.spend):'\u2014',delta(L.spend,P.spend,false,'$'));
+      $('latestNote').textContent=L.note?'\u201c'+L.note+'\u201d'+(L.events!=null?' \u00b7 '+L.events+' events':''):(L.events!=null?L.events+' calendar events':'');
+    } else $('latestCard').classList.add('hide');
+
+    // body chart
+    const bodyPts=weeks.filter(w=>w.sleep!=null||w.ready!=null||w.hrv!=null);
+    if(bodyPts.length>=2){
+      $('trendCard').classList.remove('hide');
+      $('bodyChart').innerHTML=lineChart(bodyPts,[
+        {k:'sleep',c:'var(--sleep)'},{k:'ready',c:'var(--ready)'},{k:'hrv',c:'var(--stitch)'}
+      ]);
+    } else $('trendCard').classList.add('hide');
+
+    // spend chart + latest categories
+    const spendPts=weeks.filter(w=>w.spend!=null);
+    if(spendPts.length){
+      $('spendCard').classList.remove('hide');
+      $('spendChart').innerHTML=barChart(spendPts);
+      const L=weeks[weeks.length-1];
+      if(L.cats&&L.cats.length){
+        const max=Math.max(...L.cats.map(c=>c.amount||0))||1;
+        $('catBars').innerHTML=L.cats.map(c=>
+          '<div class="row"><span class="nm">'+esc(c.name)+'</span><span class="bar"><i style="width:'+Math.round((c.amount||0)/max*100)+'%"></i></span><span class="amt">'+(c.amount!=null?fmt$(c.amount):'\u2014')+'</span></div>'
+        ).join('');
+      } else $('catBars').innerHTML='';
+    } else $('spendCard').classList.add('hide');
+
+    // history
+    $('history').innerHTML=weeks.length
+      ? [...weeks].reverse().map(w=>
+          '<div class="hrow"><div><div>'+niceDate(w.date)+' <span style="color:var(--fog);font-size:11.5px">\u00b7 '+(w.days||7)+'d</span></div><div class="d">'+esc(w.note||'')+'</div></div>'+
+          '<div style="text-align:right"><div class="nums">'+(w.sleep??'\u2013')+' / '+(w.ready??'\u2013')+' / '+(w.spend!=null?fmt$(w.spend):'\u2013')+'</div>'+
+          '<button data-d="'+w.date+'">remove</button></div></div>'
+        ).join('')
+      : '<div class="empty">No weeks logged yet. First entry starts the record \u2014 trends appear at week two.</div>';
+    $('history').querySelectorAll('button').forEach(b=>{
+      b.onclick=async()=>{ weeks=weeks.filter(w=>w.date!==b.dataset.d); await persist(); render(); };
+    });
+  }
+
+  function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+  function lineChart(pts,series){
+    const W=500,H=150,pad=22;
+    const vals=[]; series.forEach(s=>pts.forEach(p=>{ if(p[s.k]!=null) vals.push(p[s.k]); }));
+    const min=Math.min(...vals), max=Math.max(...vals), span=(max-min)||1;
+    const x=i=>pad+i*(W-2*pad)/Math.max(pts.length-1,1);
+    const y=v=>H-pad-((v-min)/span)*(H-2*pad);
+    let svg='<svg viewBox="0 0 '+W+' '+H+'" width="100%" role="img" aria-label="Body metric trends">';
+    svg+='<line x1="'+pad+'" y1="'+(H-pad)+'" x2="'+(W-pad)+'" y2="'+(H-pad)+'" stroke="var(--line)"/>';
+    series.forEach(s=>{
+      const seg=pts.map((p,i)=>p[s.k]!=null?[x(i),y(p[s.k])]:null).filter(Boolean);
+      if(seg.length<2) return;
+      svg+='<polyline fill="none" stroke="'+s.c+'" stroke-width="2" points="'+seg.map(q=>q.join(',')).join(' ')+'"/>';
+      seg.forEach(q=>svg+='<circle cx="'+q[0]+'" cy="'+q[1]+'" r="2.6" fill="'+s.c+'"/>');
+    });
+    pts.forEach((p,i)=>{ svg+='<text x="'+x(i)+'" y="'+(H-6)+'" text-anchor="middle">'+niceDate(p.date)+'</text>'; });
+    return svg+'</svg>';
+  }
+
+  function barChart(pts){
+    const W=500,H=140,pad=22;
+    const max=Math.max(...pts.map(p=>p.spend))||1;
+    const bw=Math.min(44,(W-2*pad)/pts.length*0.6);
+    let svg='<svg viewBox="0 0 '+W+' '+H+'" width="100%" role="img" aria-label="Weekly spend">';
+    pts.forEach((p,i)=>{
+      const cx=pad+(i+0.5)*(W-2*pad)/pts.length;
+      const h=(p.spend/max)*(H-2*pad-14);
+      svg+='<rect x="'+(cx-bw/2)+'" y="'+(H-pad-h)+'" width="'+bw+'" height="'+h+'" rx="4" fill="var(--money)" opacity="'+(i===pts.length-1?1:0.55)+'"/>';
+      svg+='<text x="'+cx+'" y="'+(H-pad-h-5)+'" text-anchor="middle">'+fmt$(p.spend)+'</text>';
+      svg+='<text x="'+cx+'" y="'+(H-6)+'" text-anchor="middle">'+niceDate(p.date)+'</text>';
+    });
+    return svg+'</svg>';
+  }
+
+  // ---------- week-ahead schedule ----------
+  // Planned on Sunday for the coming Mon-Sun week; count feeds the events field.
+  const SKEY='sl:schedule';
+  const DAYS=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+  let sched={weekStart:null,items:[]}; // items: [{day:0-6,text}]
+  // Seed: Claude embeds the user's real calendar week at build time.
+  // Used ONLY when it matches the current target week AND nothing is saved yet -
+  // saved schedules always win, and a stale seed is simply ignored.
+  const SCHED_SEED={weekStart:'2026-08-10',items:[
+    {day:4,text:'6:00PM Game Night'},
+    {day:5,text:'9:30AM Car stuff \u2014 Lety & Dad'},
+    {day:5,text:'12:30PM Subaru South Hills'},
+    {day:6,text:'6:00PM Weekly Check-In'}
+  ]};
+  function weekAheadMonday(){
+    const d=new Date();
+    // Sunday plans NEXT week; any other day shows the current Mon-Sun week
+    const dow=d.getDay(); // 0=Sun
+    const shift=dow===0?1:1-dow;
+    d.setDate(d.getDate()+shift);
+    return d.toISOString().slice(0,10);
+  }
+  async function loadSched(){
+    const target=weekAheadMonday();
+    try{
+      const v=await store.get(SKEY);
+      const s=v?JSON.parse(v):null;
+      if(s&&s.weekStart===target) sched=s;
+      else if(SCHED_SEED.weekStart===target){ sched=SCHED_SEED; await persistSched(); }
+      else sched={weekStart:target,items:[]};
+    }catch(e){ sched=SCHED_SEED.weekStart===target?SCHED_SEED:{weekStart:target,items:[]}; }
+    renderSched();
+  }
+  async function persistSched(){
+    if(storeTier==='memory') return;
+    await store.set(SKEY,JSON.stringify(sched));
+  }
+  function renderSched(){
+    const [y,m,dd]=sched.weekStart.split('-').map(Number);
+    const start=new Date(y,m-1,dd), end=new Date(y,m-1,dd+6);
+    $('schedRange').textContent=start.toLocaleDateString('en-US',{month:'short',day:'numeric'})+' \u2013 '+end.toLocaleDateString('en-US',{month:'short',day:'numeric'});
+    $('schedDays').innerHTML='';
+    DAYS.forEach((lbl,di)=>{
+      const row=document.createElement('div'); row.className='sday';
+      const chips=sched.items.map((it,ix)=>it.day===di?'<span class="chip">'+esc(it.text)+'<button data-ix="'+ix+'" aria-label="Remove">\u00d7</button></span>':'').join('');
+      row.innerHTML='<span class="dl">'+lbl+'</span><span class="chips">'+chips+'<input class="sadd" data-day="'+di+'" placeholder="+" aria-label="Add to '+lbl+'"></span>';
+      $('schedDays').appendChild(row);
+    });
+    $('schedCount').textContent=sched.items.length?sched.items.length+' commitment'+(sched.items.length===1?'':'s')+' planned':'Nothing planned yet \u2014 type into a day and press return.';
+    $('schedDays').querySelectorAll('.sadd').forEach(inp=>{
+      inp.onkeydown=async e=>{
+        if(e.key==='Enter'&&inp.value.trim()){
+          sched.items.push({day:Number(inp.dataset.day),text:inp.value.trim().slice(0,40)});
+          await persistSched(); renderSched();
+        }
+      };
+    });
+    $('schedDays').querySelectorAll('.chip button').forEach(b=>{
+      b.onclick=async()=>{ sched.items.splice(Number(b.dataset.ix),1); await persistSched(); renderSched(); };
+    });
+  }
+  $('schedClear').onclick=async()=>{
+    if(!sched.items.length) return;
+    sched.items=[]; await persistSched(); renderSched();
+  };
+
+  // parse pasted calendar text into schedule items
+  // handles: "Fri 6:00 PM — Game Night", "Saturday — Car stuff", "Aug 15 12:30 PM Subaru", "8/15 Subaru"
+  function parseScheduleText(text,weekStart){
+    const [wy,wm,wd]=weekStart.split('-').map(Number);
+    const wsDate=new Date(wy,wm-1,wd);
+    const MONTHS={jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11};
+    const DAYIDX={mon:0,tue:1,wed:2,thu:3,fri:4,sat:5,sun:6};
+    const items=[];
+    for(let line of text.split(/\n+/)){
+      line=line.trim().replace(/^[\u2022\-\u2013\u2014*]\s*/,'');
+      if(!line) continue;
+      let day=null,rest=line;
+      let m=line.match(/^(mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?,?\s*(.*)$/i);
+      if(m){ day=DAYIDX[m[1].toLowerCase()]; rest=m[2]; }
+      else if((m=line.match(/^([a-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s*(.*)$/i))&&MONTHS[m[1].slice(0,3).toLowerCase()]!=null){
+        const d=new Date(wy,MONTHS[m[1].slice(0,3).toLowerCase()],Number(m[2]));
+        const diff=Math.round((d-wsDate)/86400000);
+        if(diff<0||diff>6) continue;
+        day=diff; rest=m[3];
+      }
+      else if((m=line.match(/^(\d{1,2})\/(\d{1,2})(?:\/\d{2,4})?,?\s*(.*)$/))){
+        const d=new Date(wy,Number(m[1])-1,Number(m[2]));
+        const diff=Math.round((d-wsDate)/86400000);
+        if(diff<0||diff>6) continue;
+        day=diff; rest=m[3];
+      }
+      else continue; // no recognizable day - skip the line
+      // pull optional leading time, keep it in the chip
+      let time='';
+      m=rest.match(/^(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s*[\u2014\u2013\-:]?\s*(.*)$/i);
+      if(m&&m[2]&&/am|pm|:/i.test(m[1])){ time=m[1].replace(/\s+/g,'').toUpperCase()+' '; rest=m[2]; }
+      rest=rest.replace(/^[\u2014\u2013\-:]\s*/,'').trim();
+      if(!rest) continue;
+      items.push({day,text:(time+rest).slice(0,48)});
+    }
+    return items;
+  }
+  $('schedImport').onclick=async()=>{
+    const raw=$('schedPaste').value.trim();
+    if(!raw) return;
+    const parsed=parseScheduleText(raw,sched.weekStart);
+    const have=new Set(sched.items.map(i=>i.day+'|'+i.text));
+    let added=0;
+    for(const it of parsed){ if(!have.has(it.day+'|'+it.text)){ sched.items.push(it); added++; } }
+    await persistSched(); renderSched();
+    $('schedPaste').value='';
+    $('schedCount').textContent=added?added+' imported \u2014 '+sched.items.length+' total planned.':'Nothing new recognized \u2014 lines need a day (Fri, Aug 15, or 8/15) at the start.';
+  };
+
+  // ---------- Google Calendar live sync (hosted PWA only) ----------
+  // The app holds its OWN read-only grant via Google Identity Services.
+  // Google-sourced chips (src:'g') are replaced wholesale each sync; manual chips survive.
+  const GKEY='sl:gcalcfg';
+  let gcalCfg={clientId:'',connected:false};
+  let gisToken=null,tokenClient=null;
+
+  function gcalMsg(msg,cls){ const s=$('gcalStatus'); s.textContent=msg; s.className='status '+(cls||''); s.classList.remove('hide'); }
+
+  function gcalToItem(ev,weekStart){
+    if(!ev||ev.status==='cancelled'||!ev.summary) return null;
+    const [y,m,d]=weekStart.split('-').map(Number);
+    const ws=new Date(y,m-1,d);
+    let dayDate,time='';
+    if(ev.start&&ev.start.dateTime){
+      const dt=new Date(ev.start.dateTime);
+      dayDate=new Date(dt.getFullYear(),dt.getMonth(),dt.getDate());
+      time=dt.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'}).replace(/\s/g,'')+' ';
+    }else if(ev.start&&ev.start.date){
+      const [ay,am,ad]=ev.start.date.split('-').map(Number);
+      dayDate=new Date(ay,am-1,ad);
+    }else return null;
+    const diff=Math.round((dayDate-ws)/86400000);
+    if(diff<0||diff>6) return null;
+    return {day:diff,text:(time+ev.summary).slice(0,48),src:'g'};
+  }
+
+  async function gcalFetchWeek(token){
+    const [y,m,d]=sched.weekStart.split('-').map(Number);
+    const tMin=new Date(y,m-1,d).toISOString();
+    const tMax=new Date(y,m-1,d+7).toISOString();
+    const url='https://www.googleapis.com/calendar/v3/calendars/primary/events?singleEvents=true&orderBy=startTime&maxResults=50'+
+      '&timeMin='+encodeURIComponent(tMin)+'&timeMax='+encodeURIComponent(tMax);
+    const r=await fetch(url,{headers:{Authorization:'Bearer '+token}});
+    if(r.status===401||r.status===403) throw new Error('auth expired');
+    if(!r.ok) throw new Error('Calendar HTTP '+r.status);
+    return (await r.json()).items||[];
+  }
+
+  async function gcalSync(token){
+    const events=await gcalFetchWeek(token);
+    const fresh=events.map(ev=>gcalToItem(ev,sched.weekStart)).filter(Boolean);
+    const manual=sched.items.filter(i=>i.src!=='g');
+    const manualKeys=new Set(manual.map(i=>i.day+'|'+i.text.replace(/^\d{1,2}:\d{2}(AM|PM)\s/,'')));
+    sched.items=[...manual,...fresh.filter(g=>!manualKeys.has(g.day+'|'+g.text.replace(/^\d{1,2}:\d{2}(AM|PM)\s/,'')))];
+    await persistSched(); renderSched();
+    gcalMsg('Synced '+fresh.length+' event'+(fresh.length===1?'':'s')+' from Google Calendar \u2014 '+new Date().toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'}),'ok');
+  }
+
+  function ensureGis(){
+    return new Promise((res,rej)=>{
+      if(window.google&&window.google.accounts) return res();
+      const s=document.createElement('script');
+      s.src='https://accounts.google.com/gsi/client';
+      s.onload=()=>res(); s.onerror=()=>rej(new Error('couldn\u2019t load Google sign-in'));
+      document.head.appendChild(s);
+    });
+  }
+
+  async function gcalRequestToken(silent){
+    await ensureGis();
+    return new Promise((res,rej)=>{
+      if(!tokenClient){
+        tokenClient=window.google.accounts.oauth2.initTokenClient({
+          client_id:gcalCfg.clientId,
+          scope:'https://www.googleapis.com/auth/calendar.readonly',
+          callback:()=>{}, error_callback:()=>{}
+        });
+      }
+      tokenClient.callback=t=>{ if(t&&t.access_token){ gisToken=t.access_token; res(t.access_token);} else rej(new Error('no token')); };
+      tokenClient.error_callback=e=>rej(new Error(e&&e.type?e.type:'sign-in cancelled'));
+      tokenClient.requestAccessToken(silent?{prompt:''}:{});
+    });
+  }
+
+  async function gcalConnectFlow(silent){
+    if(!gcalCfg.clientId){ $('gcalSetup').classList.remove('hide'); return; }
+    try{
+      if(!silent) gcalMsg('Connecting\u2026');
+      const token=gisToken||await gcalRequestToken(silent);
+      await gcalSync(token);
+      gcalCfg.connected=true; await store.set(GKEY,JSON.stringify(gcalCfg));
+      $('gcalBtn').textContent='Refresh from Calendar';
+    }catch(e){
+      gisToken=null;
+      if(e.message==='auth expired'){ try{ await gcalSync(await gcalRequestToken(false)); return; }catch(e2){ e=e2; } }
+      if(!silent) gcalMsg('Sync failed ('+e.message+'). Check the Client ID setup in the README, then try again.','err');
+    }
+  }
+
+  $('gcalBtn').onclick=()=>gcalConnectFlow(false);
+  $('gcalSaveId').onclick=async()=>{
+    const id=$('gcalClientId').value.trim();
+    if(!/apps\.googleusercontent\.com$/.test(id)){ gcalMsg('That doesn\u2019t look like a Client ID \u2014 it ends in apps.googleusercontent.com','err'); return; }
+    gcalCfg.clientId=id; await store.set(GKEY,JSON.stringify(gcalCfg));
+    $('gcalSetup').classList.add('hide');
+    gcalConnectFlow(false);
+  };
+  async function gcalInit(){
+    try{ const v=await store.get(GKEY); if(v) gcalCfg=JSON.parse(v); }catch(e){}
+    if(storeTier==='memory'){ $('gcalBtn').disabled=true; gcalMsg('Calendar sync needs the hosted version (device storage) \u2014 use paste import here.'); return; }
+    if(gcalCfg.connected&&gcalCfg.clientId){
+      $('gcalBtn').textContent='Refresh from Calendar';
+      gcalConnectFlow(true); // silent auto-sync on launch
+    }
+  }
+
+  // ---------- backup / restore ----------
+  function bakMsg(msg,cls){
+    const b=$('bakStatus'); b.textContent=msg; b.className='status '+(cls||''); b.classList.remove('hide');
+  }
+  $('expBtn').onclick=async()=>{
+    if(!weeks.length){ bakMsg('Nothing to back up yet.','err'); return; }
+    const blob='SL-BACKUP:'+JSON.stringify({weeks:weeks,schedule:sched});
+    $('backupBox').value=blob;
+    try{
+      await navigator.clipboard.writeText(blob);
+      bakMsg('Backup copied to clipboard \u2014 paste it anywhere safe (Notes works).','ok');
+    }catch(e){
+      $('backupBox').focus(); $('backupBox').select();
+      bakMsg('Backup is in the box above \u2014 select all and copy it.','ok');
+    }
+  };
+  async function importBlob(raw){
+    raw=String(raw).trim().replace(/^SL-BACKUP:/,'');
+    let parsed;
+    try{ parsed=JSON.parse(raw); }catch(e){ bakMsg('That doesn\u2019t look like a Ledger backup \u2014 use the full copied text or the downloaded file.','err'); return; }
+    // v1 backups are a bare array; v2 backups are {weeks,schedule}
+    const data=Array.isArray(parsed)?parsed:(parsed&&Array.isArray(parsed.weeks)?parsed.weeks:null);
+    if(!data||!data.every(w=>w&&typeof w.date==='string')){ bakMsg('Backup format not recognized.','err'); return; }
+    if(parsed&&!Array.isArray(parsed)&&parsed.schedule&&parsed.schedule.weekStart===weekAheadMonday()){
+      sched=parsed.schedule; await persistSched(); renderSched();
+    }
+    const dates=new Set(data.map(w=>w.date));
+    weeks=[...weeks.filter(w=>!dates.has(w.date)),...data];
+    weeks.sort((a,b)=>a.date.localeCompare(b.date));
+    const ok=await persist();
+    render();
+    bakMsg('Restored '+data.length+' entr'+(data.length===1?'y':'ies')+(ok===true?' and saved.':' for this session \u2014 storage unavailable here.'),'ok');
+  }
+  $('impBtn').onclick=()=>{
+    const raw=$('backupBox').value.trim();
+    if(!raw){ bakMsg('Paste a backup into the box first.','err'); return; }
+    importBlob(raw);
+  };
+  $('dlBtn').onclick=()=>{
+    if(!weeks.length){ bakMsg('Nothing to back up yet.','err'); return; }
+    const blob=new Blob([JSON.stringify({weeks:weeks,schedule:sched},null,1)],{type:'application/json'});
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(blob);
+    a.download='sunday-ledger-'+new Date().toISOString().slice(0,10)+'.json';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(a.href),4000);
+    bakMsg('File created \u2014 on iPhone choose Save to Files, then pick iCloud Drive (or the Google Drive folder).','ok');
+  };
+  $('ulBtn').onclick=()=>$('ulInput').click();
+  $('ulInput').onchange=e=>{
+    const f=e.target.files[0];
+    if(!f) return;
+    const r=new FileReader();
+    r.onload=()=>importBlob(r.result);
+    r.onerror=()=>bakMsg('Couldn\u2019t read that file \u2014 try again.','err');
+    r.readAsText(f);
+    e.target.value='';
+  };
+
+  load().then(()=>{ loadSched().then(()=>gcalInit()); });
+  // PWA offline support - only when properly hosted over https
+  try{
+    if('serviceWorker' in navigator && location.protocol==='https:' && location.hostname!=='localhost'){
+      navigator.serviceWorker.register('sw.js').catch(()=>{});
+    }
+  }catch(e){}
+})();
+</script>
+</body>
+</html>
